@@ -32,9 +32,9 @@ import sounddevice as sd
 
 # ── Config ────────────────────────────────────────────────────────────────────
 SAMPLE_RATE = 16000
-SILENCE_RMS = 0.006
+SILENCE_RMS = 0.012
 DEFAULT_PORT = 7890
-DEFAULT_INTERVAL = 1.5  # seconds between streaming updates
+DEFAULT_INTERVAL = 2.5  # seconds between streaming updates
 
 GRAFANA_URL = os.environ.get("GRAFANA_URL", "https://triscient.grafana.net")
 GRAFANA_TOKEN = os.environ.get(
@@ -141,88 +141,122 @@ def save_transcript(text):
 
 
 # ── Streaming Transcription Loop ─────────────────────────────────────────────
+SILENCE_STREAK_RESET = 4      # reset state after N consecutive silent intervals
+MAX_STREAM_CHUNKS = 200       # reset state after N chunks to prevent decoder drift
+
+
 def transcription_loop(model, interval):
     import mlx.core as mx
 
     broadcast({"type": "status", "content": "Listening..."})
     log("Listening - speak into your microphone (streaming mode)")
 
+    def new_stream():
+        return model.transcribe_stream(context_size=(256, 256), depth=2)
+
+    ctx = new_stream()
+    transcriber = ctx.__enter__()
+
     update_count = 0
+    session_chunks = 0
     total_audio_sec = 0.0
     total_infer_ms = 0.0
     prev_finalized_count = 0
     prev_text = ""
+    silence_streak = 0
 
-    with model.transcribe_stream(context_size=(256, 256), depth=1) as transcriber:
-        while running:
-            time.sleep(interval)
-            chunk = drain_buffer()
-            if chunk is None or len(chunk) < 800:  # < 50ms, skip
-                continue
+    def reset_stream(reason):
+        nonlocal transcriber, ctx, session_chunks, prev_finalized_count, prev_text, silence_streak
+        log(f"  -- stream reset ({reason}) --")
+        try:
+            ctx.__exit__(None, None, None)
+        except Exception:
+            pass
+        ctx = new_stream()
+        transcriber = ctx.__enter__()
+        session_chunks = 0
+        prev_finalized_count = 0
+        prev_text = ""
+        silence_streak = 0
+        return ctx, transcriber
 
-            rms = float(np.sqrt(np.mean(chunk ** 2)))
-            if rms < SILENCE_RMS:
-                continue
+    while running:
+        time.sleep(interval)
+        chunk = drain_buffer()
+        if chunk is None or len(chunk) < 800:
+            silence_streak += 1
+            if silence_streak >= SILENCE_STREAK_RESET and session_chunks > 0:
+                ctx, transcriber = reset_stream("sustained silence")
+            continue
 
-            audio_sec = len(chunk) / SAMPLE_RATE
-            audio_mx = mx.array(chunk)
+        rms = float(np.sqrt(np.mean(chunk ** 2)))
+        if rms < SILENCE_RMS:
+            silence_streak += 1
+            if silence_streak >= SILENCE_STREAK_RESET and session_chunks > 0:
+                ctx, transcriber = reset_stream("sustained silence")
+            continue
 
-            t0 = time.perf_counter()
-            try:
-                transcriber.add_audio(audio_mx)
-            except Exception as e:
-                log(f"streaming error: {e}")
-                continue
-            elapsed_ms = (time.perf_counter() - t0) * 1000
+        silence_streak = 0
+        session_chunks += 1
 
-            update_count += 1
-            total_audio_sec += audio_sec
-            total_infer_ms += elapsed_ms
+        # Periodic reset to prevent decoder state drift
+        if session_chunks >= MAX_STREAM_CHUNKS:
+            ctx, transcriber = reset_stream(f"drift prevention after {MAX_STREAM_CHUNKS} chunks")
 
-            # Extract finalized and draft text
-            finalized_tokens = transcriber.finalized_tokens
-            draft_tokens = transcriber.draft_tokens
+        audio_sec = len(chunk) / SAMPLE_RATE
+        audio_mx = mx.array(chunk)
 
-            fin_text = "".join(
-                t.text for t in finalized_tokens
+        t0 = time.perf_counter()
+        try:
+            transcriber.add_audio(audio_mx)
+        except Exception as e:
+            log(f"streaming error: {e}")
+            ctx, transcriber = reset_stream("error recovery")
+            continue
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+
+        update_count += 1
+        total_audio_sec += audio_sec
+        total_infer_ms += elapsed_ms
+
+        # Extract finalized and draft text
+        finalized_tokens = transcriber.finalized_tokens
+        draft_tokens = transcriber.draft_tokens
+
+        fin_text = "".join(t.text for t in finalized_tokens).strip()
+        draft_text = "".join(t.text for t in draft_tokens).strip()
+
+        full_text = f"{fin_text} {draft_text}".strip()
+        if not full_text or full_text == prev_text:
+            continue
+        prev_text = full_text
+
+        broadcast({
+            "type": "stream",
+            "finalized": fin_text,
+            "draft": draft_text,
+        })
+
+        # Save newly finalized text to disk + Grafana
+        new_fin_count = len(finalized_tokens)
+        if new_fin_count > prev_finalized_count:
+            new_text = "".join(
+                t.text for t in finalized_tokens[prev_finalized_count:]
             ).strip()
-            draft_text = "".join(
-                t.text for t in draft_tokens
-            ).strip()
+            if new_text:
+                save_transcript(new_text)
+                threading.Thread(
+                    target=push_annotation, args=(new_text,), daemon=True
+                ).start()
+            prev_finalized_count = new_fin_count
 
-            full_text = f"{fin_text} {draft_text}".strip()
-            if not full_text or full_text == prev_text:
-                continue
-
-            prev_text = full_text
-
-            # Broadcast update with both finalized and draft
-            broadcast({
-                "type": "stream",
-                "finalized": fin_text,
-                "draft": draft_text,
-            })
-
-            # Save newly finalized text to disk + Grafana
-            new_fin_count = len(finalized_tokens)
-            if new_fin_count > prev_finalized_count:
-                new_text = "".join(
-                    t.text for t in finalized_tokens[prev_finalized_count:]
-                ).strip()
-                if new_text:
-                    save_transcript(new_text)
-                    threading.Thread(
-                        target=push_annotation, args=(new_text,), daemon=True
-                    ).start()
-                prev_finalized_count = new_fin_count
-
-            avg_ms = total_infer_ms / update_count
-            rtf = (total_infer_ms / 1000) / total_audio_sec if total_audio_sec > 0 else 0
-            log(
-                f"  [{elapsed_ms:.0f}ms | avg {avg_ms:.0f}ms | "
-                f"RTF={rtf:.4f} | #{update_count}] "
-                f"{fin_text[-60:]}|{draft_text[:40]}"
-            )
+        avg_ms = total_infer_ms / update_count
+        rtf = (total_infer_ms / 1000) / total_audio_sec if total_audio_sec > 0 else 0
+        log(
+            f"  [{elapsed_ms:.0f}ms | avg {avg_ms:.0f}ms | "
+            f"RTF={rtf:.4f} | s{session_chunks}/{MAX_STREAM_CHUNKS}] "
+            f"{fin_text[-50:]}|{draft_text[:35]}"
+        )
 
 
 # ── HTML ──────────────────────────────────────────────────────────────────────
