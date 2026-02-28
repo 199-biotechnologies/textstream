@@ -723,8 +723,8 @@ def main():
         channels=1,
         dtype="float32",
         callback=audio_callback,
-        blocksize=0,  # Let CoreAudio choose optimal buffer size
-        latency="low",  # Apple Silicon low-latency hint
+        blocksize=int(SAMPLE_RATE * 0.1),  # 100ms chunks (1600 samples)
+        latency="low",
     )
     stream.start()
     log("Microphone active")
