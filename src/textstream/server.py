@@ -362,7 +362,7 @@ def transcription_loop(interval, vad_threshold):
             gc.collect()
             try:
                 import mlx.core as mx
-                mx.metal.clear_cache()
+                mx.clear_cache()
             except Exception:
                 pass
             new_engine = ENGINES[new_name]()
@@ -761,7 +761,7 @@ def main():
     # Limit MLX Metal cache to prevent memory pressure on 8/16GB Macs
     try:
         import mlx.core as mx
-        mx.metal.set_cache_limit(1024 * 1024 * 1024)  # 1GB
+        mx.set_cache_limit(1024 * 1024 * 1024)  # 1GB
     except Exception:
         pass
 
