@@ -42,14 +42,15 @@ GRAFANA_URL = os.environ.get("GRAFANA_URL", "https://triscient.grafana.net")
 GRAFANA_TOKEN = os.environ.get("GRAFANA_SERVICE_ACCOUNT_TOKEN", "")
 
 # ── State ─────────────────────────────────────────────────────────────────────
-audio_chunks = []
-buffer_lock = threading.Lock()
+audio_queue = queue.Queue(maxsize=int(SAMPLE_RATE * 10 / 1600))  # Cap ~10s of audio
 subscribers = []
 sub_lock = threading.Lock()
 running = True
 paused = False
 current_engine = None
 engine_lock = threading.Lock()
+pending_engine_name = None  # Set by /switch, consumed by transcription loop
+annotation_queue = queue.Queue(maxsize=100)
 
 
 def log(msg):
@@ -58,19 +59,22 @@ def log(msg):
 
 # ── Audio Capture ─────────────────────────────────────────────────────────────
 def audio_callback(indata, frames, time_info, status):
-    if status:
-        log(f"audio warning: {status}")
-    with buffer_lock:
-        audio_chunks.append(indata[:, 0].copy())
+    """PortAudio callback — must be realtime-safe (no locks, no logging)."""
+    try:
+        audio_queue.put_nowait(indata[:, 0].copy())
+    except queue.Full:
+        pass  # Drop oldest — inference is lagging
 
 
 def drain_buffer():
-    global audio_chunks
-    with buffer_lock:
-        if not audio_chunks:
-            return None
-        chunks = audio_chunks
-        audio_chunks = []
+    chunks = []
+    try:
+        while True:
+            chunks.append(audio_queue.get_nowait())
+    except queue.Empty:
+        pass
+    if not chunks:
+        return None
     return np.concatenate(chunks)
 
 
@@ -96,7 +100,7 @@ def broadcast(event_data):
 
 
 # ── Grafana Annotation Push ───────────────────────────────────────────────────
-def push_annotation(text):
+def _push_annotation_http(text):
     try:
         payload = json.dumps({
             "text": text,
@@ -115,6 +119,26 @@ def push_annotation(text):
         urllib.request.urlopen(req, timeout=5)
     except Exception as e:
         log(f"grafana push failed: {e}")
+
+
+def _annotation_worker():
+    """Single background thread draining annotation_queue."""
+    while running:
+        try:
+            text = annotation_queue.get(timeout=1)
+            _push_annotation_http(text)
+        except queue.Empty:
+            continue
+        except Exception:
+            continue
+
+
+def push_annotation(text):
+    """Queue an annotation for async push (non-blocking)."""
+    try:
+        annotation_queue.put_nowait(text)
+    except queue.Full:
+        pass
 
 
 # ── Transcript File Persistence ───────────────────────────────────────────────
@@ -262,9 +286,7 @@ class QwenEngine(ASREngine):
             # Don't persist hallucinated text
             if new_text and not self._is_hallucination(new_text):
                 save_transcript(new_text)
-                threading.Thread(
-                    target=push_annotation, args=(new_text,), daemon=True
-                ).start()
+                push_annotation(new_text)
             self._prev_stable_len = len(stable)
 
         return stable, draft
@@ -278,9 +300,7 @@ class QwenEngine(ASREngine):
                     remaining = final[self._prev_stable_len:].strip()
                     if remaining:
                         save_transcript(remaining)
-                        threading.Thread(
-                            target=push_annotation, args=(remaining,), daemon=True
-                        ).start()
+                        push_annotation(remaining)
             except Exception as e:
                 log(f"qwen finish error: {e}")
         self._state = None
@@ -301,7 +321,9 @@ SILENCE_STREAK_RESET = 4
 
 
 def transcription_loop(interval, vad_threshold):
-    global current_engine
+    global current_engine, pending_engine_name
+
+    import gc
 
     from .vad import contains_speech
 
@@ -329,20 +351,40 @@ def transcription_loop(interval, vad_threshold):
             drain_buffer()
             continue
 
-        # Check for engine switch
-        with engine_lock:
-            if current_engine is not engine:
-                log("Engine switch detected, transitioning...")
-                engine.stop()
-                engine = current_engine
-                engine.start()
-                prev_text = ""
-                silence_streak = 0
-                update_count = 0
-                total_audio_sec = 0.0
-                total_infer_ms = 0.0
-                broadcast({"type": "status", "content": f"Switched to {engine.name}"})
-                continue
+        # Check for engine switch — serialized here so old model is freed
+        # before new one loads (prevents both models in memory simultaneously)
+        if pending_engine_name is not None:
+            new_name = pending_engine_name
+            pending_engine_name = None
+            log(f"Engine switch: stopping {engine.name}, loading {new_name}...")
+            engine.stop()
+            del engine
+            gc.collect()
+            try:
+                import mlx.core as mx
+                mx.metal.clear_cache()
+            except Exception:
+                pass
+            new_engine = ENGINES[new_name]()
+            try:
+                new_engine.load()
+            except Exception as e:
+                log(f"Engine load failed: {e}, reverting...")
+                broadcast({"type": "status", "content": f"Failed to load {new_name}"})
+                new_engine = ENGINES["qwen"]()
+                new_engine.load()
+            engine = new_engine
+            with engine_lock:
+                current_engine = engine
+            engine.start()
+            prev_text = ""
+            silence_streak = 0
+            update_count = 0
+            total_audio_sec = 0.0
+            total_infer_ms = 0.0
+            broadcast({"type": "engine", "engine": engine.name})
+            broadcast({"type": "status", "content": f"Switched to {engine.name}"})
+            continue
 
         chunk = drain_buffer()
         if chunk is None or len(chunk) < 800:
@@ -603,7 +645,7 @@ class Handler(BaseHTTPRequestHandler):
             threading.Thread(target=lambda: os.kill(os.getpid(), signal.SIGTERM), daemon=True).start()
 
         elif self.path.startswith("/switch"):
-            global current_engine
+            global pending_engine_name
             from urllib.parse import urlparse, parse_qs
             params = parse_qs(urlparse(self.path).query)
             engine_name = params.get("engine", [""])[0]
@@ -616,35 +658,22 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             with engine_lock:
-                if current_engine.name == engine_name:
+                if current_engine and current_engine.name == engine_name:
                     self.send_response(200)
                     self.send_header("Content-Type", "text/plain")
                     self.end_headers()
                     self.wfile.write(b"already active")
                     return
 
-            # Load model outside lock to avoid blocking transcription loop
-            log(f"Switching engine: loading {engine_name}...")
-            new_engine = ENGINES[engine_name]()
-            try:
-                new_engine.load()
-            except Exception as e:
-                self.send_response(500)
-                self.send_header("Content-Type", "text/plain")
-                self.end_headers()
-                self.wfile.write(f"Failed to load {engine_name}: {e}".encode())
-                log(f"Engine load failed: {e}")
-                return
-
-            with engine_lock:
-                current_engine = new_engine
-
-            broadcast({"type": "engine", "engine": engine_name})
+            # Signal transcription loop to handle the switch (serialized:
+            # old model freed before new one loads, preventing OOM)
+            pending_engine_name = engine_name
+            broadcast({"type": "status", "content": f"Switching to {engine_name}..."})
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
-            self.wfile.write(f"switched to {engine_name}".encode())
-            log(f"Engine switched to {engine_name}")
+            self.wfile.write(f"switching to {engine_name}".encode())
+            log(f"Engine switch queued: {engine_name}")
 
         elif self.path == "/engine":
             with engine_lock:
@@ -659,7 +688,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")  # Disable nginx/proxy buffering
             self.end_headers()
+            self.wfile.write(b"retry: 3000\n\n")  # Auto-reconnect hint for EventSource
+            self.wfile.flush()
 
             q = queue.Queue(maxsize=50)
             with sub_lock:
@@ -723,6 +755,15 @@ def main():
     if args.no_grafana or not GRAFANA_TOKEN:
         global push_annotation
         push_annotation = lambda text: None
+    else:
+        threading.Thread(target=_annotation_worker, daemon=True).start()
+
+    # Limit MLX Metal cache to prevent memory pressure on 8/16GB Macs
+    try:
+        import mlx.core as mx
+        mx.metal.set_cache_limit(1024 * 1024 * 1024)  # 1GB
+    except Exception:
+        pass
 
     # Create and load initial engine
     current_engine = ENGINES[args.engine]()
@@ -733,7 +774,8 @@ def main():
         channels=1,
         dtype="float32",
         callback=audio_callback,
-        blocksize=int(SAMPLE_RATE * 0.1),
+        blocksize=0,  # Let CoreAudio choose optimal buffer size
+        latency="low",  # Apple Silicon low-latency hint
     )
     stream.start()
     log("Microphone active")
